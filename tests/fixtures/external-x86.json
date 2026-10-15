@@ -1,0 +1,347 @@
+{
+  "tools": {
+    "keystone": "0.9.2",
+    "unicorn": "2.1.4",
+    "mode": "16-bit x86"
+  },
+  "encodings": [
+    {
+      "source": "MOV AX, 65535",
+      "bytes": [184, 255, 255]
+    },
+    {
+      "source": "MOV AL, 255",
+      "bytes": [176, 255]
+    },
+    {
+      "source": "MOV AH, 0",
+      "bytes": [180, 0]
+    },
+    {
+      "source": "MOV AX, BX",
+      "bytes": [137, 216]
+    },
+    {
+      "source": "MOV AH, BL",
+      "bytes": [136, 220]
+    },
+    {
+      "source": "MOV DS, AX",
+      "bytes": [142, 216]
+    },
+    {
+      "source": "MOV AX, CS",
+      "bytes": [140, 200]
+    },
+    {
+      "source": "MOV AX, [0100h]",
+      "bytes": [161, 0, 1]
+    },
+    {
+      "source": "MOV [0100h], AL",
+      "bytes": [162, 0, 1]
+    },
+    {
+      "source": "MOV CX, [0100h]",
+      "bytes": [139, 14, 0, 1]
+    },
+    {
+      "source": "MOV AX, [BP]",
+      "bytes": [139, 70, 0]
+    },
+    {
+      "source": "MOV AX, ES:[BX+SI+2]",
+      "bytes": [38, 139, 64, 2]
+    },
+    {
+      "source": "MOV WORD PTR [SI], 256",
+      "bytes": [199, 4, 0, 1]
+    },
+    {
+      "source": "MOV BYTE PTR [DI], 255",
+      "bytes": [198, 5, 255]
+    },
+    {
+      "source": "ADD AX, 1",
+      "bytes": [131, 192, 1]
+    },
+    {
+      "source": "ADD AX, 256",
+      "bytes": [5, 0, 1]
+    },
+    {
+      "source": "ADD BX, 256",
+      "bytes": [129, 195, 0, 1]
+    },
+    {
+      "source": "ADD AL, 255",
+      "bytes": [4, 255]
+    },
+    {
+      "source": "SUB CX, -1",
+      "bytes": [131, 233, 255]
+    },
+    {
+      "source": "CMP BL, 255",
+      "bytes": [128, 251, 255]
+    },
+    {
+      "source": "ADD WORD PTR [SI], 1",
+      "bytes": [131, 4, 1]
+    },
+    {
+      "source": "CMP WORD PTR [SI], 256",
+      "bytes": [129, 60, 0, 1]
+    },
+    {
+      "source": "INC AX",
+      "bytes": [64]
+    },
+    {
+      "source": "DEC AH",
+      "bytes": [254, 204]
+    },
+    {
+      "source": "INC WORD PTR [BP]",
+      "bytes": [255, 70, 0]
+    },
+    {
+      "source": "LEA DI, [BX+SI+2]",
+      "bytes": [141, 120, 2]
+    },
+    {
+      "source": "MOV CX, [SI-128]",
+      "bytes": [139, 76, 128]
+    },
+    {
+      "source": "MOV CX, [SI+128]",
+      "bytes": [139, 140, 128, 0]
+    },
+    {
+      "source": "MOV CX, [SI+65535]",
+      "bytes": [139, 140, 255, 255],
+      "canonicalSource": "MOV CX, [SI-1]",
+      "canonicalBytes": [139, 76, 255]
+    },
+    {
+      "source": "NOP\nHLT",
+      "bytes": [144, 244]
+    },
+    {
+      "source": "again: DEC CX\nJNZ again\nHLT",
+      "bytes": [73, 117, 253, 244]
+    },
+    {
+      "source": "JMP end\nNOP\nend: HLT",
+      "bytes": [235, 1, 144, 244]
+    },
+    {
+      "source": "MOV AX, SS:[BP+DI+4]",
+      "bytes": [54, 139, 67, 4]
+    },
+    {
+      "source": "CMP AL, 0",
+      "bytes": [60, 0]
+    },
+    {
+      "source": "SUB WORD PTR [BX+DI+4], 256",
+      "bytes": [129, 105, 4, 0, 1]
+    }
+  ],
+  "execution": [
+    {
+      "name": "aliases and byte wrapping",
+      "source": "MOV AX, 65535\nINC AL\nMOV BH, AH\nSUB BH, 255\nHLT",
+      "expected": {
+        "registers": {
+          "AX": 65280,
+          "BX": 0,
+          "CX": 0,
+          "DX": 0,
+          "SI": 0,
+          "DI": 0,
+          "BP": 0,
+          "SP": 0,
+          "DS": 0,
+          "ES": 0,
+          "SS": 0,
+          "CS": 0
+        },
+        "zf": true,
+        "steps": 5,
+        "memory": []
+      }
+    },
+    {
+      "name": "segments and little-endian indexed memory",
+      "source": "MOV AX, 1000h\nMOV DS, AX\nMOV WORD PTR [0100h], 1234h\nMOV BX, 0100h\nMOV SI, 2\nMOV WORD PTR [BX+SI], 0ABCDh\nMOV CX, [0100h]\nMOV DX, [BX+SI]\nHLT",
+      "inspect": [65792, 65793, 65794, 65795],
+      "expected": {
+        "registers": {
+          "AX": 4096,
+          "BX": 256,
+          "CX": 4660,
+          "DX": 43981,
+          "SI": 2,
+          "DI": 0,
+          "BP": 0,
+          "SP": 0,
+          "DS": 4096,
+          "ES": 0,
+          "SS": 0,
+          "CS": 0
+        },
+        "zf": false,
+        "steps": 9,
+        "memory": [
+          {
+            "address": 65792,
+            "value": 52
+          },
+          {
+            "address": 65793,
+            "value": 18
+          },
+          {
+            "address": 65794,
+            "value": 205
+          },
+          {
+            "address": 65795,
+            "value": 171
+          }
+        ]
+      }
+    },
+    {
+      "name": "loop over a four-word array",
+      "source": "MOV SI, 0100h\nMOV CX, 4\nMOV AX, 0\nagain: ADD AX, [SI]\nADD SI, 2\nDEC CX\nJNZ again\nMOV [0108h], AX\nHLT",
+      "memory": [
+        {
+          "address": 256,
+          "value": 10
+        },
+        {
+          "address": 258,
+          "value": 20
+        },
+        {
+          "address": 260,
+          "value": 30
+        },
+        {
+          "address": 262,
+          "value": 40
+        }
+      ],
+      "inspect": [264, 265],
+      "expected": {
+        "registers": {
+          "AX": 100,
+          "BX": 0,
+          "CX": 0,
+          "DX": 0,
+          "SI": 264,
+          "DI": 0,
+          "BP": 0,
+          "SP": 0,
+          "DS": 0,
+          "ES": 0,
+          "SS": 0,
+          "CS": 0
+        },
+        "zf": true,
+        "steps": 21,
+        "memory": [
+          {
+            "address": 264,
+            "value": 100
+          },
+          {
+            "address": 265,
+            "value": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "LEA and default SS",
+      "source": "MOV AX, 2000h\nMOV SS, AX\nMOV BP, 0100h\nMOV SI, 2\nMOV WORD PTR [BP+SI+2], 42\nLEA DI, [BP+SI+2]\nMOV DX, [BP+SI+2]\nHLT",
+      "inspect": [131332, 131333],
+      "expected": {
+        "registers": {
+          "AX": 8192,
+          "BX": 0,
+          "CX": 0,
+          "DX": 42,
+          "SI": 2,
+          "DI": 260,
+          "BP": 256,
+          "SP": 0,
+          "DS": 0,
+          "ES": 0,
+          "SS": 8192,
+          "CS": 0
+        },
+        "zf": false,
+        "steps": 8,
+        "memory": [
+          {
+            "address": 131332,
+            "value": 42
+          },
+          {
+            "address": 131333,
+            "value": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "CMP does not write and a taken JZ",
+      "source": "MOV AX, 256\nCMP AX, 256\nJZ end\nMOV BX, 1\nend: HLT",
+      "expected": {
+        "registers": {
+          "AX": 256,
+          "BX": 0,
+          "CX": 0,
+          "DX": 0,
+          "SI": 0,
+          "DI": 0,
+          "BP": 0,
+          "SP": 0,
+          "DS": 0,
+          "ES": 0,
+          "SS": 0,
+          "CS": 0
+        },
+        "zf": true,
+        "steps": 4,
+        "memory": []
+      }
+    },
+    {
+      "name": "word wrapping and an untaken JNZ",
+      "source": "MOV AX, 65535\nINC AX\nJNZ end\nMOV DX, 255\nend: HLT",
+      "expected": {
+        "registers": {
+          "AX": 0,
+          "BX": 0,
+          "CX": 0,
+          "DX": 255,
+          "SI": 0,
+          "DI": 0,
+          "BP": 0,
+          "SP": 0,
+          "DS": 0,
+          "ES": 0,
+          "SS": 0,
+          "CS": 0
+        },
+        "zf": true,
+        "steps": 5,
+        "memory": []
+      }
+    }
+  ]
+}

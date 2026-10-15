@@ -7,7 +7,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { metrics, parse } from "./engine";
+import { metrics, parse, createState } from "./engine";
 import { modeInfo, modes, type Mode } from "./examples";
 import { examples } from "./examples";
 import { analyzeProgram } from "./analyzer";
@@ -21,22 +21,45 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
           : m === "Direct"
             ? "MOV AX, [0100h]"
             : "MOV AX, [SI+10h]";
-    const perf = metrics(parse(text).instructions[0]);
+    const program = parse(text);
+    const perf = metrics(
+      program.instructions[0],
+      createState(program, { SI: 0x100 }),
+    );
     return { name: m, text, ...perf };
   });
   const whole = [
-    { name: "Immediate", source: "MOV AX, 42\nHLT" },
-    { name: "Register + setup", source: "MOV BX, 42\nMOV AX, BX\nHLT" },
+    { name: "Immediate", source: "MOV AX, 42\nHLT", setupInstructions: 0 },
+    {
+      name: "Register + setup",
+      source: "MOV BX, 42\nMOV AX, BX\nHLT",
+      setupInstructions: 1,
+    },
     {
       name: "Direct + data",
       source: ".DATA\nvalue DW 42\n.CODE\nMOV AX, [value]\nHLT",
+      setupInstructions: 0,
     },
     {
       name: "Indexed + setup",
       source: ".DATA\nvalue DW 42\n.CODE\nMOV SI, 0100h\nMOV AX, [SI]\nHLT",
+      setupInstructions: 1,
     },
-    { name: "Array loop (4 words)", source: examples["Sum an array"] },
-  ].map((p) => ({ ...p, ...analyzeProgram(p.source) }));
+    {
+      name: "Array direct (4 words)",
+      source:
+        ".DATA\nvalues DW 10, 20, 30, 40\ntotal DW 0\n.CODE\nMOV AX, 0\nADD AX, [0100h]\nADD AX, [0102h]\nADD AX, [0104h]\nADD AX, [0106h]\nMOV [total], AX\nHLT",
+      setupInstructions: 1,
+    },
+    {
+      name: "Array indexed loop (4 words)",
+      source: examples["Sum an array"],
+      setupInstructions: 3,
+    },
+  ].map((p) => ({
+    ...p,
+    ...analyzeProgram(p.source, { setupInstructions: p.setupInstructions }),
+  }));
   return (
     <>
       <div className="comparison-intro">
@@ -44,7 +67,9 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
         <h2>Moving one word into AX</h2>
         <p>
           Compare the final MOV only. Direct uses the accumulator’s dedicated
-          address encoding. Indexed uses SI + 10h and assumes an even address.
+          address encoding. Indexed uses SI = 0100h plus 10h. All word operands
+          are aligned. The dedicated accumulator direct MOV has a fixed 10-clock
+          reference cost; it has no additional EA term.
         </p>
       </div>
       <div className="comparison-grid">
@@ -80,14 +105,14 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
                 dataKey="ea"
                 fill="#bed0fa"
                 radius={[5, 5, 0, 0]}
-                name="EA clocks (included)"
+                name="Additional EA (included)"
                 barSize={38}
               />
             </BarChart>
           </ResponsiveContainer>
           <div className="chart-legend">
             <span>● Total clocks</span>
-            <span>● EA overhead, included in total</span>
+            <span>● Additional EA term, included in total</span>
           </div>
         </section>
         <section className="panel comparison-notes">
@@ -118,7 +143,7 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
               <th>Instruction</th>
               <th>Bytes</th>
               <th>Clocks</th>
-              <th>EA clocks</th>
+              <th>Additional EA</th>
               <th>Data access</th>
             </tr>
           </thead>
@@ -136,11 +161,7 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
                 <td>{r.bytes}</td>
                 <td>{r.clocks}</td>
                 <td>{r.ea}</td>
-                <td>
-                  {["Direct", "Indexed"].includes(r.name)
-                    ? "1 word read"
-                    : "None"}
-                </td>
+                <td>{r.reads ? `${r.reads} word read` : "None"}</td>
               </tr>
             ))}
           </tbody>
@@ -150,20 +171,29 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
         <span className="blue-label">WHOLE-PROGRAM COMPARISON</span>
         <h2>Include the work around the operand</h2>
         <p>
-          These independent programs all load 42 into AX and halt, except the
-          array experiment, which sums four words. Totals come from executing
-          the sources below. Code size counts each instruction once; clocks and
+          The first four programs load 42 into AX and halt. Both array programs
+          sum the same four words into AX and store 100 in total. Direct access
+          is unrolled; indexed access uses a loop. They perform the same data
+          task but use different control flow, so do not attribute all
+          differences to addressing alone. Totals come from executing the
+          sources below. Code size counts each instruction once; clocks and
           transfers count every executed iteration. Declarations add data
-          storage, not code bytes. HLT entry is included.
+          storage, not code bytes. HLT entry is included. Data declarations are
+          preloaded by the lab: initialization costs no CPU clocks in this
+          experiment. Setup counts explicitly marked leading MOV instructions
+          executed once; it is included in total clocks. Array setup covers AX
+          initialization and, for indexing, SI and CX.
         </p>
         <div className="table-wrap">
           <table>
             <thead>
               <tr>
                 <th>Program</th>
-                <th>Code bytes</th>
+                <th>Static code / data bytes</th>
                 <th>Instructions executed</th>
                 <th>Clocks</th>
+                <th>EA clocks</th>
+                <th>Setup clocks (included)</th>
                 <th>Reads / writes</th>
               </tr>
             </thead>
@@ -171,9 +201,13 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
               {whole.map((p) => (
                 <tr key={p.name}>
                   <th>{p.name}</th>
-                  <td>{p.codeBytes ?? "Unavailable"}</td>
+                  <td>
+                    {p.codeBytes} / {p.dataBytes}
+                  </td>
                   <td>{p.steps}</td>
                   <td>{p.clocks ?? "Unavailable"}</td>
+                  <td>{p.ea}</td>
+                  <td>{p.setup.oneTime ? p.setup.clocks : "Repeated setup"}</td>
                   <td>
                     {p.reads} / {p.writes}
                   </td>
@@ -191,6 +225,24 @@ export function Compare({ onTry }: { onTry: (m: Mode) => void }) {
           ))}
         </div>
       </section>
+      <section className="panel lesson">
+        <h2>Explain the results in a viva</h2>
+        <p>
+          Code size counts static encoded bytes once. Execution cost counts the
+          path actually taken, including repeated branches and index updates. A
+          short branch is 2 bytes whether taken or not, but JZ/JNZ costs 16
+          clocks taken and 4 not taken. Memory reads/writes count operand
+          transfers, not instruction fetches; a read-modify-write operation
+          counts one of each.
+        </p>
+        <p>
+          State the workload, initial registers and memory, word alignment, and
+          whether setup is included. An unrolled direct array access can trade
+          larger code for fewer control-flow instructions. Indexed loops reuse
+          code and adapt to array length. Neither result makes one addressing
+          mode universally best.
+        </p>
+      </section>
       <ReferenceNote />
     </>
   );
@@ -203,9 +255,14 @@ function ReferenceNote() {
         Intel 8086, no bus wait states. Odd-address word transfers add 4 clocks
         per transfer. Segment overrides add 2 clocks. MOV uses a canonical
         encoding (including the short accumulator direct form); alternate valid
-        encodings may differ. EA clocks are included in total clocks. Branches
-        and immediate arithmetic show unavailable; totals never substitute zero
-        for unknown forms.
+        encodings may differ. Additional EA clocks are included in total clocks;
+        dedicated accumulator direct MOV has fixed timing with no +EA term.
+        Immediate arithmetic uses accumulator, signed-byte, or full-width
+        encodings. JMP chooses SHORT where possible, otherwise NEAR; JZ/JNZ are
+        SHORT only (-128 to +127 bytes). Conditional clocks are 16 taken / 4 not
+        taken, based on pre-instruction ZF. Summed clocks exclude prefetch
+        interactions and are not cycle-accurate measurements. A missing
+        condition shows unavailable rather than a fabricated total.
       </p>
       <a
         href="https://www.inf.pucrs.br/~calazans/undergrad/orgcomp_EC/mat_microproc/intel-8086_family_Users_Manual.pdf"
@@ -313,7 +370,7 @@ export function Guide({ onTry }: { onTry: (m: Mode) => void }) {
                 [
                   "JMP / JZ / JNZ",
                   "Branch always / if zero / if nonzero",
-                  "defined label in .CODE",
+                  "defined label; JMP [SHORT/NEAR] label, JZ/JNZ [SHORT] label. Conditional jumps must fit -128…+127 bytes.",
                 ],
                 ["NOP / HLT", "No operation / end execution", "no operands"],
               ].map((r) => (
@@ -348,16 +405,23 @@ export function Guide({ onTry }: { onTry: (m: Mode) => void }) {
           MiB. Words are little-endian. AX, BX, CX, DX expose AL/AH, BL/BH,
           CL/CH, DL/DH. Segment registers support MOV to/from a general word
           register or word memory; CS is read-only. Only ZF is modeled. PC is an
-          instruction index, not a machine-code IP. No interrupts, stack
-          instructions, I/O, macros, strings, DUP, OFFSET operator, relocations,
-          binary output, or other flags. This is an educational interpreter, not
-          a complete MASM compiler or full CPU emulator.
+          instruction index; IP shows the resolved code-byte offset. Branches
+          use the resolved encoded displacement, with range errors reported
+          before execution. No interrupts, stack instructions, I/O, macros,
+          strings, DUP, OFFSET operator, relocations, binary output, or other
+          flags. This is an educational interpreter, not a complete MASM
+          compiler or full CPU emulator.
         </p>
         <p>
           Run yields between batches, Stop pauses, Step continues, and Reset
-          reparses the current source. Runs stop after 10,000 instructions. The
-          latest 100 log entries are retained. Memory edits apply to the current
-          initialized state; fresh runs reinitialize it.
+          reparses the current source and restores initial registers/data. Run
+          and Step continue the initialized state (including inspector edits);
+          Run after halt starts fresh. Changing source or initial settings
+          invalidates execution, so Reset before editing memory. Memory
+          snapshots preserve previous states without copying 1 MiB on every
+          instruction. Runs stop after 10,000 instructions. The latest 100 log
+          entries are retained. Memory edits apply to the current initialized
+          state; fresh runs reinitialize it.
         </p>
       </section>
       <ReferenceNote />

@@ -73,15 +73,15 @@ describe("execution semantics", () => {
       "MOV AX, 1234h\nMOV DS, AX\nMOV WORD PTR [10h], 0ABCDh\nMOV BX, [10h]\nMOV ES, AX\nMOV CX, ES:[10h]",
     );
     const s = run(p, createState(p));
-    expect(s.memory[0x12350]).toBe(0xcd);
-    expect(s.memory[0x12351]).toBe(0xab);
+    expect(s.memory.readByte(0x12350)).toBe(0xcd);
+    expect(s.memory.readByte(0x12351)).toBe(0xab);
     expect(s.regs.BX).toBe(0xabcd);
     expect(s.regs.CX).toBe(0xabcd);
   });
   it("defaults BP addresses to SS; LEA does not read memory", () => {
     const p = parse("MOV AX, [BP+SI+2]\nLEA DI, [BP+SI+2]");
     let s = createState(p, { BP: 0xfffe, SI: 3, DS: 0x1000, SS: 0x2000 });
-    s.memory[0x20003] = 7;
+    s.memory = s.memory.withWrites([{ address: 0x20003, value: 7 }]);
     s = step(p, s);
     expect(s.regs.AX).toBe(7);
     expect(s.accesses[0].offset).toBe(3);
@@ -110,8 +110,8 @@ describe("execution semantics", () => {
     const p = parse("MOV WORD PTR [SI], 1234h");
     const s = createState(p);
     const next = step(p, s);
-    expect(s.memory[0]).toBe(0);
-    expect(next.memory[0]).toBe(0x34);
+    expect(s.memory.readByte(0)).toBe(0);
+    expect(next.memory.readByte(0)).toBe(0x34);
     expect(s.steps).toBe(0);
   });
   it.each(Object.entries(examples))("runs example %s", (_name, source) => {
@@ -121,12 +121,12 @@ describe("execution semantics", () => {
   it("array example sums every element", () => {
     const s = execute(examples["Sum an array"]);
     expect(s.regs.AX).toBe(100);
-    expect(s.memory[0x108]).toBe(100);
+    expect(s.memory.readByte(0x108)).toBe(100);
     expect(s.regs.CX).toBe(0);
   });
   it("byte example branches after wrapping", () => {
     const s = execute(examples["Byte arithmetic"]);
-    expect(s.memory[0x100]).toBe(0);
+    expect(s.memory.readByte(0x100)).toBe(0);
     expect(s.regs.BX).toBe(0);
   });
 });
@@ -134,7 +134,7 @@ describe("reference estimates", () => {
   it.each([
     ["MOV AX, 42", 3, 4, 0],
     ["MOV AX, BX", 2, 2, 0],
-    ["MOV AX, [0100h]", 3, 10, 6],
+    ["MOV AX, [0100h]", 3, 10, 0],
     ["MOV CX, [0100h]", 4, 14, 6],
     ["MOV AX, [SI+10h]", 3, 17, 9],
     ["MOV AX, [SI]", 2, 13, 5],
@@ -155,10 +155,15 @@ describe("reference estimates", () => {
       clocks: 16,
     });
   });
-  it("never invents unavailable timing", () => {
-    const p = parse("again: ADD AX, 2\nJMP again");
-    expect(metrics(p.instructions[0]).clocks).toBeNull();
-    expect(metrics(p.instructions[1]).bytes).toBeNull();
-    expect(step(p, createState(p)).timingComplete).toBe(false);
+  it("leaves conditional clocks unavailable without flags but resolves encodings", () => {
+    const p = parse("again: ADD AX, 2\nJNZ again");
+    expect(metrics(p.instructions[0]).clocks).toBe(4);
+    expect(metrics(p.instructions[1])).toMatchObject({
+      bytes: 2,
+      clocks: null,
+      clocksTaken: 16,
+      clocksNotTaken: 4,
+    });
+    expect(step(p, createState(p)).timingComplete).toBe(true);
   });
 });

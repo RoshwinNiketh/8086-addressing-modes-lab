@@ -72,6 +72,9 @@ function App() {
     [example, setExample] = useState<keyof typeof examples>("All four modes"),
     [memOffset, setMemOffset] = useState("0100h");
   const dirtyRef = useRef(true);
+  const [needsInitialization, setNeedsInitialization] = useState(true);
+  const generation = useRef(0),
+    timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null),
     decorations = useRef<monaco.editor.IEditorDecorationsCollection | null>(
       null,
@@ -83,6 +86,9 @@ function App() {
     stateRef.current = state;
     programRef.current = program;
   }, [state, program]);
+  const indexExpression = displacement.trim().startsWith("-")
+    ? `${index} ${displacement}`
+    : `${index} + ${displacement}`;
   const instruction =
     mode === "Immediate"
       ? `MOV ${destination}, ${operand}`
@@ -90,7 +96,7 @@ function App() {
         ? `MOV ${destination}, ${sourceRegister}`
         : mode === "Direct"
           ? `MOV ${destination}, [${operand}]`
-          : `MOV ${destination}, [${index} + ${displacement}]`;
+          : `MOV ${destination}, [${indexExpression}]`;
   const inputs = () =>
     Object.fromEntries(
       registers.map((r) => {
@@ -110,11 +116,14 @@ function App() {
           v = numberOf(memoryValue);
         if (v < 0 || v > 65535)
           throw new Error("Memory word must be between 0 and 65535.");
-        s.memory[loc.address] = v & 255;
-        s.memory[(loc.address + 1) & 0xfffff] = v >> 8;
+        s.memory = s.memory.withWrites([
+          { address: loc.address, value: v },
+          { address: (loc.address + 1) & 0xfffff, value: v >> 8 },
+        ]);
       }
     }
     dirtyRef.current = false;
+    setNeedsInitialization(false);
     setProgram(p);
     setState(s);
     setBefore(null);
@@ -123,18 +132,22 @@ function App() {
   };
   const stop = useCallback(() => {
     runRef.current = false;
+    generation.current++;
+    clearTimeout(timer.current);
     setRunning(false);
   }, []);
   useEffect(
     () => () => {
       runRef.current = false;
+      generation.current++;
+      clearTimeout(timer.current);
     },
     [],
   );
   useEffect(() => {
     const ins = program.instructions[state.pc];
     decorations.current?.set(
-      ins && !state.halted
+      ins && !state.halted && !needsInitialization
         ? [
             {
               range: {
@@ -152,8 +165,13 @@ function App() {
           ]
         : [],
     );
-    if (ins) editorRef.current?.revealLineInCenterIfOutsideViewport(ins.line);
-  }, [program, state]);
+    if (
+      ins &&
+      !needsInitialization &&
+      !editorRef.current?.getModel()?.isDisposed()
+    )
+      editorRef.current?.revealLineInCenterIfOutsideViewport(ins.line);
+  }, [program, state, needsInitialization]);
   const reset = () => {
     stop();
     try {
@@ -179,20 +197,25 @@ function App() {
         return;
       }
       runRef.current = true;
+      const token = ++generation.current;
       setRunning(true);
       const tick = () => {
-        if (!runRef.current) return;
+        if (!runRef.current || token !== generation.current) return;
         try {
           let next = stateRef.current;
-          for (let k = 0; k < 20 && !next.halted; k++)
+          let lastBefore = next;
+          for (let k = 0; k < 20 && !next.halted; k++) {
+            lastBefore = next;
             next = step(programRef.current, next);
+          }
+          setBefore(lastBefore);
           setState(next);
           stateRef.current = next;
           if (next.halted) {
             stop();
             return;
           }
-          setTimeout(tick, 25);
+          timer.current = setTimeout(tick, 25);
         } catch (e) {
           setError((e as Error).message);
           stop();
@@ -200,7 +223,7 @@ function App() {
       };
       stateRef.current = s;
       programRef.current = p;
-      setTimeout(tick, 0);
+      timer.current = setTimeout(tick, 0);
     } catch (e) {
       setError((e as Error).message);
       stop();
@@ -208,13 +231,29 @@ function App() {
   };
   const invalidate = () => {
     dirtyRef.current = true;
+    setNeedsInitialization(true);
     stop();
-    setState((s) => ({ ...s, steps: 0, halted: false, log: [], accesses: [] }));
+    setState((s) => ({
+      ...s,
+      pc: 0,
+      ip: 0,
+      steps: 0,
+      clocks: 0,
+      eaClocks: 0,
+      memoryReads: 0,
+      memoryWrites: 0,
+      timingComplete: true,
+      zf: false,
+      halted: false,
+      log: [],
+      accesses: [],
+    }));
     setBefore(null);
     setError("");
   };
   const selectPage = (p: Page) => {
     dirtyRef.current = true;
+    setNeedsInitialization(true);
     stop();
     setPage(p);
     setBefore(null);
@@ -242,15 +281,35 @@ function App() {
     /* errors are shown when executing */
   }
   let offset = 0x100;
+  let memoryOffsetError = "";
   try {
-    offset = numberOf(memOffset) & 65535;
-  } catch {
-    /* keep last default while typing */
+    offset = numberOf(memOffset);
+    if (offset < 0 || offset > 65535)
+      throw new Error("Memory offset must be between 0 and 65535.");
+  } catch (e) {
+    memoryOffsetError = (e as Error).message;
   }
   const format = (v: number, w = 4) => (base === "hex" ? hex(v, w) : String(v));
   const onEditorMount: OnMount = (ed) => {
     editorRef.current = ed;
     decorations.current = ed.createDecorationsCollection();
+    const ins = program.instructions[state.pc];
+    if (ins && !needsInitialization && !state.halted)
+      decorations.current.set([
+        {
+          range: {
+            startLineNumber: ins.line,
+            startColumn: 1,
+            endLineNumber: ins.line,
+            endColumn: 1,
+          },
+          options: {
+            isWholeLine: true,
+            className: "executing-line",
+            glyphMarginClassName: "executing-glyph",
+          },
+        },
+      ]);
   };
   const lastAccess = state.accesses[0];
   const effectiveTrace = lastAccess
@@ -299,7 +358,7 @@ function App() {
         </div>
         <div className="sidebar-bottom">
           <span className="status-dot" /> Runs locally in your browser
-          <span className="version">v1.0</span>
+          <span className="version">v2.0</span>
         </div>
       </aside>
       <div className="main-shell">
@@ -406,7 +465,7 @@ function App() {
                                 ? sourceRegister
                                 : mode === "Direct"
                                   ? `[${operand}]`
-                                  : `[${index} + ${displacement}]`}
+                                  : `[${indexExpression}]`}
                           </em>
                         </code>
                       </div>
@@ -617,13 +676,15 @@ function App() {
                   note="8086 · no wait states"
                 />
                 <Metric
-                  label="EA calculation"
+                  label="Additional EA clocks"
                   value={preview?.ea ?? "—"}
                   unit="clocks"
                   note={
                     mode === "Immediate" || mode === "Register"
                       ? "No effective address needed"
-                      : "Included in total clocks"
+                      : preview?.ea === 0
+                        ? "Direct accumulator MOV: fixed timing"
+                        : "Already included in total clocks"
                   }
                 />
                 <Metric
@@ -723,12 +784,23 @@ function App() {
                   {state.halted ? "Halted" : running ? "Running" : "Ready"}
                 </span>
               </div>
-              <div className="program-summary">
+              <p className="control-help">
+                Run continues until halt or Stop; Step executes one instruction.
+                After halt, Run restarts. Reset reparses source and restores
+                initial registers and data. Editing source or initial inputs
+                requires initialization before memory edits.
+              </p>
+              <div className="program-summary" aria-live="polite">
                 Whole program:{" "}
-                {state.timingComplete
-                  ? `${state.clocks} theoretical clocks executed`
-                  : "Total clocks unavailable (contains an unestimated instruction)"}{" "}
-                · PC {state.pc} (instruction index) · limit 10,000 instructions
+                {needsInitialization
+                  ? "Initialize with Run, Step, or Reset"
+                  : state.timingComplete
+                    ? `${state.clocks} theoretical clocks executed`
+                    : "Total clocks unavailable (contains an unestimated instruction)"}{" "}
+                · {needsInitialization ? "—" : program.codeBytes} static code
+                bytes · PC {state.pc} / IP {hex(state.ip)}h · EA{" "}
+                {state.eaClocks} clocks · {state.memoryReads} reads /{" "}
+                {state.memoryWrites} writes · limit 10,000 instructions
               </div>
             </div>
           )}
@@ -782,7 +854,9 @@ function App() {
                         ·{" "}
                         {before
                           ? "Highlighted registers changed in the last operation"
-                          : "Edit initial values below before running"}
+                          : needsInitialization
+                            ? "Inputs pending: Run, Step, or Reset initializes current settings"
+                            : "Initialized state; Step and Run continue from here"}
                       </small>
                     </span>
                     <span className="flag">
@@ -845,23 +919,43 @@ function App() {
                       DS = {hex(state.regs.DS)}h · blue: read · amber: write
                     </span>
                   </div>
+                  {memoryOffsetError && (
+                    <p className="input-error" role="alert">
+                      {memoryOffsetError}
+                    </p>
+                  )}
+                  {needsInitialization && (
+                    <p className="control-help">
+                      Inputs changed. Reset to initialize memory before editing
+                      it.
+                    </p>
+                  )}
                   <div className="memory-grid">
                     {Array.from({ length: 32 }, (_, k) => {
                       const off = (offset + k) & 65535,
                         addr = ((state.regs.DS << 4) + off) & 0xfffff,
-                        access = state.accesses.find(
+                        accesses = state.accesses.filter(
                           (a) =>
                             a.address === addr ||
                             (a.width === 16 &&
                               ((a.address + 1) & 0xfffff) === addr),
                         );
                       return (
-                        <label key={off} className={access?.kind ?? ""}>
+                        <label
+                          key={off}
+                          className={accesses.map((a) => a.kind).join(" ")}
+                          title={accesses.map((a) => a.kind).join(" + ")}
+                        >
                           <span>{hex(off)}</span>
                           <input
                             aria-label={`Memory ${hex(off)}`}
-                            value={format(state.memory[addr], 2)}
-                            disabled={running}
+                            value={format(state.memory.readByte(addr), 2)}
+                            disabled={
+                              running ||
+                              needsInitialization ||
+                              state.halted ||
+                              Boolean(memoryOffsetError)
+                            }
                             maxLength={base === "hex" ? 2 : 3}
                             onChange={(e) => {
                               try {
@@ -873,8 +967,9 @@ function App() {
                                 if (value < 0 || value > 255)
                                   throw new Error("Memory byte must be 0–255.");
                                 setState((s) => {
-                                  const memory = s.memory.slice();
-                                  memory[addr] = value;
+                                  const memory = s.memory.withWrites([
+                                    { address: addr, value },
+                                  ]);
                                   return { ...s, memory };
                                 });
                                 setError("");
@@ -888,9 +983,11 @@ function App() {
                     })}
                   </div>
                   <p className="input-help">
-                    Bytes are editable after Reset. Step uses the inspected
-                    state; a fresh Run initializes from the inputs and
-                    declarations.
+                    Reset initializes memory from declarations (or the guided
+                    memory word). Inspector edits persist through Step, Stop,
+                    and resumed Run. A completed program must be Reset before
+                    editing; restarting or changing source/initial inputs
+                    discards inspector edits.
                   </p>
                   {state.accesses.map((a, i) => (
                     <p className="access-detail" key={i}>

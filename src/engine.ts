@@ -1,3 +1,5 @@
+import { Memory } from "./memory";
+import { encode, layout } from "./encoding";
 export const registers = [
   "AX",
   "BX",
@@ -44,11 +46,17 @@ export type Instruction = {
   target?: number;
   line: number;
   text: string;
+  offset?: number;
+  encoding?: number[];
+  displacement?: number;
+  branchHint?: "short" | "near";
+  branchForm?: "short" | "near";
 };
 export type Program = {
   instructions: Instruction[];
   data: { offset: number; value: number }[];
   symbols: Record<string, { offset: number; width: number }>;
+  codeBytes: number;
 };
 export type Access = {
   address: number;
@@ -60,14 +68,18 @@ export type Access = {
 };
 export type State = {
   regs: Record<Register, number>;
-  memory: Uint8Array;
+  memory: Memory;
   pc: number;
+  ip: number;
   zf: boolean;
   halted: boolean;
   steps: number;
   accesses: Access[];
   log: string[];
   clocks: number;
+  eaClocks: number;
+  memoryReads: number;
+  memoryWrites: number;
   timingComplete: boolean;
 };
 const ops: Record<string, number> = {
@@ -148,7 +160,11 @@ export function parse(source: string): Program {
     }
     const m = s.match(/^(?:(DS|SS|ES|CS):)?\[(.+)\]$/);
     if (m) {
+      if (/\w\s+\w/.test(m[2]))
+        throw new Error("Missing operator in memory expression.");
       const terms = m[2].replace(/\s/g, "").match(/[+-]?[^+-]+/g) || [];
+      if (!terms.length)
+        throw new Error("Memory brackets require an address expression.");
       if (terms.join("") !== m[2].replace(/\s/g, ""))
         throw new Error(
           "Malformed memory expression. Separate terms with one + or - operator.",
@@ -210,9 +226,24 @@ export function parse(source: string): Program {
       if (fields.length !== ops[op] || fields.some((s) => !s))
         throw new Error(`${op} requires ${ops[op]} operand(s).`);
       if (["JMP", "JZ", "JNZ"].includes(op)) {
-        if (!Object.hasOwn(labels, fields[0]))
-          throw new Error(`Unknown label ${fields[0]}.`);
-        instructions.push({ ...row, op, args: [], target: labels[fields[0]] });
+        const branch = fields[0].match(/^(?:(SHORT|NEAR)\s+)?([A-Z_]\w*)$/);
+        if (!branch)
+          throw new Error(
+            "Expected a label, optionally qualified SHORT or NEAR.",
+          );
+        if (branch[1] === "NEAR" && op !== "JMP")
+          throw new Error(
+            "Original 8086 conditional jumps support SHORT only.",
+          );
+        if (!Object.hasOwn(labels, branch[2]))
+          throw new Error(`Unknown label ${branch[2]}.`);
+        instructions.push({
+          ...row,
+          op,
+          args: [],
+          target: labels[branch[2]],
+          branchHint: branch[1]?.toLowerCase() as "short" | "near" | undefined,
+        });
         continue;
       }
       const args = fields.map(operand),
@@ -275,7 +306,8 @@ export function parse(source: string): Program {
   }
   if (!instructions.length)
     throw new Error("Add at least one instruction in .CODE.");
-  return { instructions, data, symbols };
+  const codeBytes = layout(instructions);
+  return { instructions, data, symbols, codeBytes };
 }
 export function createState(
   program: Program,
@@ -287,19 +319,26 @@ export function createState(
       initial[r] === undefined ? 0 : initial[r]! & 65535,
     ]),
   ) as State["regs"];
-  const memory = new Uint8Array(1 << 20);
-  for (const d of program.data)
-    memory[((regs.DS << 4) + d.offset) & 0xfffff] = d.value;
+  const memory = Memory.fromWrites(
+    program.data.map((d) => ({
+      address: ((regs.DS << 4) + d.offset) & 0xfffff,
+      value: d.value,
+    })),
+  );
   return {
     regs,
     memory,
     pc: 0,
+    ip: 0,
     zf: false,
     halted: false,
     steps: 0,
     accesses: [],
     log: [],
     clocks: 0,
+    eaClocks: 0,
+    memoryReads: 0,
+    memoryWrites: 0,
     timingComplete: true,
   };
 }
@@ -342,78 +381,62 @@ export function metrics(
   bytes: number | null;
   clocks: number | null;
   ea: number;
+  addressEA: number;
   reads: number;
   writes: number;
+  clocksTaken?: number;
+  clocksNotTaken?: number;
   note: string;
 } {
   const [a, b] = i.args,
-    m = i.args.find((o) => o.kind === "mem") as
-      Extract<Operand, { kind: "mem" }> | undefined,
-    ea = m ? eaClocks(m) : 0;
-  const prefix = m?.segment ? 1 : 0,
-    disp = m
-      ? !m.regs.length
-        ? 2
-        : m.disp === 0
-          ? m.regs.length === 1 && m.regs[0] === "BP"
-            ? 1
-            : 0
-          : m.disp >= -128 && m.disp <= 127
-            ? 1
-            : 2
-      : 0;
-  const odd = m && s && m.width === 16 && address(s, m).address & 1 ? 4 : 0,
-    transfers = m
-      ? a === m && ["ADD", "SUB", "INC", "DEC"].includes(i.op)
-        ? 2
-        : 1
-      : 0;
-  let size: number | null = null,
-    clocks: number | null = null;
-  if (i.op === "MOV") {
-    const acc =
-      m &&
-      !m.regs.length &&
-      i.args.some((o) => o.kind === "reg" && ["AX", "AL"].includes(o.name));
-    size = m
-      ? (acc ? 3 : 2 + disp) + (b?.kind === "imm" ? (m.width || 16) / 8 : 0)
-      : b?.kind === "imm"
-        ? 1 + (a as { width: number }).width / 8
-        : 2;
+    m = i.args.find((o) => o.kind === "mem");
+  const accumulatorDirect =
+    i.op === "MOV" &&
+    m &&
+    !m.regs.length &&
+    i.args.some((o) => o.kind === "reg" && ["AX", "AL"].includes(o.name));
+  const addressEA = m ? eaClocks(m) : 0,
+    ea = accumulatorDirect ? 0 : addressEA;
+  const reads = m && i.op !== "LEA" && !(i.op === "MOV" && a === m) ? 1 : 0;
+  const writes = m && a === m && i.op !== "CMP" ? 1 : 0;
+  let clocks: number | null = null;
+  if (i.op === "MOV")
     clocks = m
-      ? acc
+      ? accumulatorDirect
         ? 10
         : (b?.kind === "imm" ? 10 : a === m ? 9 : 8) + ea
       : b?.kind === "imm"
         ? 4
         : 2;
-  } else if (i.op === "NOP" || i.op === "HLT") {
-    size = 1;
-    clocks = i.op === "NOP" ? 3 : 2;
-  } else if (["INC", "DEC"].includes(i.op)) {
-    size = m ? 2 + disp : (a as { width: number }).width === 16 ? 1 : 2;
-    clocks = m ? 15 + ea : (a as { width: number }).width === 16 ? 2 : 3;
-  } else if (i.op === "LEA") {
-    size = 2 + disp;
-    clocks = 2 + ea;
-  } else if (["ADD", "SUB", "CMP"].includes(i.op)) {
-    // Encoding selection for immediate arithmetic is deliberately not estimated.
-    if (b?.kind !== "imm") {
-      size = 2 + disp;
-      clocks = m ? (i.op === "CMP" || b === m ? 9 : 16) + ea : 3;
-    }
-  }
-  // Branch encoding and taken/not-taken timing depend on layout; unavailable.
+  else if (i.op === "LEA") clocks = 2 + ea;
+  else if (["INC", "DEC"].includes(i.op))
+    clocks = m ? 15 + ea : a.kind !== "imm" && a.width === 16 ? 2 : 3;
+  else if (["ADD", "SUB", "CMP"].includes(i.op))
+    clocks =
+      b.kind === "imm"
+        ? m
+          ? (i.op === "CMP" ? 10 : 17) + ea
+          : 4
+        : m
+          ? (i.op === "CMP" || b === m ? 9 : 16) + ea
+          : 3;
+  else if (i.op === "NOP" || i.op === "HLT") clocks = i.op === "NOP" ? 3 : 2;
+  else if (i.op === "JMP") clocks = 15;
+  else if (i.op === "JZ" || i.op === "JNZ")
+    clocks = s ? ((i.op === "JZ" ? s.zf : !s.zf) ? 16 : 4) : null;
+  const odd = m && s && m.width === 16 && address(s, m).address & 1 ? 4 : 0;
+  if (clocks !== null) clocks += odd * (reads + writes) + (m?.segment ? 2 : 0);
   return {
-    bytes: size === null ? null : size + prefix,
-    clocks:
-      clocks === null
-        ? null
-        : clocks + (i.op === "LEA" ? 0 : odd * transfers) + (prefix ? 2 : 0),
+    bytes: (i.encoding ?? encode(i)).length,
+    clocks,
     ea,
-    reads: m && i.op !== "LEA" && !(i.op === "MOV" && a === m) ? 1 : 0,
-    writes: m && a === m && i.op !== "CMP" ? 1 : 0,
-    note: "8086, no wait states; odd word transfers add 4 clocks each. Explicit segment prefixes add 2 clocks. Canonical MOV encoding; immediate arithmetic and branches unavailable.",
+    addressEA,
+    reads,
+    writes,
+    ...(["JZ", "JNZ"].includes(i.op)
+      ? { clocksTaken: 16, clocksNotTaken: 4 }
+      : {}),
+    note: "Intel 8086, no wait states. Word alignment is assumed even unless state is provided; odd word transfers add 4 clocks per read/write. Explicit segment prefixes add 2 clocks. Accumulator direct MOV has fixed timing, no additional EA term. Conditional timing requires pre-instruction ZF (16 taken / 4 not taken). Canonical bytes and byte offsets are resolved at parse time; summed clocks are estimates, not cycle-accurate hardware measurements.",
   };
 }
 export function step(program: Program, previous: State, limit = 10000): State {
@@ -425,7 +448,7 @@ export function step(program: Program, previous: State, limit = 10000): State {
   const s: State = {
     ...previous,
     regs: { ...previous.regs },
-    memory: previous.memory.slice(),
+    memory: previous.memory,
     accesses: [],
     log: [...previous.log],
   };
@@ -439,8 +462,10 @@ export function step(program: Program, previous: State, limit = 10000): State {
     if (o.kind === "reg") return readReg(s, o.name);
     const loc = address(s, o),
       value =
-        s.memory[loc.address] |
-        (o.width === 16 ? s.memory[(loc.address + 1) & 0xfffff] << 8 : 0);
+        s.memory.readByte(loc.address) |
+        (o.width === 16
+          ? s.memory.readByte((loc.address + 1) & 0xfffff) << 8
+          : 0);
     s.accesses.push({ ...loc, kind: "read", value, width: o.width! });
     return value;
   };
@@ -449,8 +474,12 @@ export function step(program: Program, previous: State, limit = 10000): State {
     else if (o.kind === "mem") {
       const loc = address(s, o),
         value = v & (o.width === 8 ? 255 : 65535);
-      s.memory[loc.address] = value & 255;
-      if (o.width === 16) s.memory[(loc.address + 1) & 0xfffff] = value >> 8;
+      s.memory = s.memory.withWrites([
+        { address: loc.address, value },
+        ...(o.width === 16
+          ? [{ address: (loc.address + 1) & 0xfffff, value: value >> 8 }]
+          : []),
+      ]);
       s.accesses.push({ ...loc, kind: "write", value, width: o.width! });
     }
   };
@@ -476,11 +505,15 @@ export function step(program: Program, previous: State, limit = 10000): State {
   )
     s.pc = i.target!;
   else if (i.op === "HLT") s.halted = true;
+  s.ip = program.instructions[s.pc]?.offset ?? program.codeBytes;
   if (s.pc >= program.instructions.length) s.halted = true;
   s.clocks += perf.clocks ?? 0;
+  s.eaClocks += perf.ea;
+  s.memoryReads += s.accesses.filter((a) => a.kind === "read").length;
+  s.memoryWrites += s.accesses.filter((a) => a.kind === "write").length;
   s.timingComplete &&= perf.clocks !== null;
   s.log = [
-    `${s.steps}. ${i.text} → ${s.halted ? "halted" : `PC ${s.pc}`} · ZF=${Number(s.zf)}`,
+    `${s.steps}. ${i.text} → ${s.halted ? "halted" : `PC ${s.pc} / IP ${hex(s.ip)}h`} · ZF=${Number(s.zf)}`,
     ...s.log,
   ].slice(0, 100);
   return s;

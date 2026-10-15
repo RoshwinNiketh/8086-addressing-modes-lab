@@ -19,7 +19,9 @@ export default defineConfig({
   webServer: deployedURL
     ? undefined
     : {
-        command: "npm run dev -- --port 5186 --strictPort",
+        command: process.env.CI
+          ? "npm run preview -- --port 5186 --strictPort"
+          : "npm run dev -- --port 5186 --strictPort",
         url: "http://127.0.0.1:5186",
         reuseExistingServer: !process.env.CI,
       },
